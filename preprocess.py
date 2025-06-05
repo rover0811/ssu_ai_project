@@ -11,116 +11,54 @@ from functools import partial
 import time
 
 
-def process_single_file(args):
+def dump_feature_korean_safe(training_dir, output_dir, num_workers=None):
     """
-    단일 파일 처리 함수 (멀티프로세싱용)
-    """
-    json_file, training_dir = args
-
-    try:
-        with open(json_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        # 음성 파일 경로와 텍스트 추출
-        audio_relative_path = data["01_dataset"]["3_src_path"]  # source/eng/comp/C02199/U00001.wav
-        audio_file_path = '/'.join(audio_relative_path.split('/')[-2:])
-
-        text = data["06_transcription"]["1_text"]
-        major = data["03_lectureinfo"]["3_major_category"]
-        file_id = data["01_dataset"]["1_identifier"]
-
-        # Label 폴더에서 Voice 폴더로 경로 변경
-        # Training/Label/xxx.json -> Training/Voice/source/eng/comp/C02199/U00001.wav
-        voice_path = os.path.join(training_dir, "Voice", audio_file_path)
-
-        if os.path.exists(voice_path):
-            # Whisper 입력 형태로 변환
-            audio = whisper.load_audio(voice_path)
-            mel = whisper.log_mel_spectrogram(audio)
-
-            return {
-                'feature': mel,
-                'text': text,
-                'major': major,
-                'file_id': file_id,
-                'status': 'success'
-            }
-        else:
-            return {'status': 'audio_not_found', 'file': str(json_file), 'expected_path': voice_path}
-
-    except Exception as e:
-        return {'status': 'error', 'file': str(json_file), 'error': str(e)}
-
-
-def dump_feature_korean_mp(training_dir, output_dir, num_workers=None):
-    """
-    멀티프로세싱을 사용한 한국어 대학 강의 데이터 전처리
-    training_dir: IT_Lecture/Training 경로
+    메모리 안전 버전 - 단일 프로세스로 순차 처리
     """
     if num_workers is None:
-        num_workers = cpu_count()  # 최대 8개 프로세스
+        num_workers = 4  # 기본값 설정
 
-    print(f"Using {num_workers} workers for processing")
+    # Whisper 모델을 한 번만 로드
+    model = whisper.load_model("medium")
 
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Label 폴더에서 JSON 파일 목록 수집
+    # 경로 정보만 멀티프로세싱으로 수집
     label_dir = os.path.join(training_dir, "Label")
     json_files = list(Path(label_dir).glob("**/*.json"))
-    print(f"Found {len(json_files)} JSON files in {label_dir}")
 
-    # 멀티프로세싱 인자 준비 (training_dir 전달)
     args_list = [(json_file, training_dir) for json_file in json_files]
 
+    # 경로 정보 수집 (멀티프로세싱)
+    with Pool(4) as pool:  # 적은 수의 프로세스
+        file_info_list = pool.map(process_single_file_light, args_list)
+
+    valid_files = [info for info in file_info_list if info['status'] == 'success']
+
+    # 순차적으로 Whisper 처리 (메모리 절약)
     features = []
     texts = []
     majors = []
-    file_ids = []
 
-    start_time = time.time()
+    for i, info in enumerate(valid_files):
+        try:
+            audio = whisper.load_audio(info['voice_path'])
+            mel = whisper.log_mel_spectrogram(audio)
 
-    # 청크 단위로 처리 (메모리 절약)
-    chunk_size = 100
-    total_processed = 0
+            features.append(mel)
+            texts.append(info['text'])
+            majors.append(info['major'])
 
-    for i in range(0, len(args_list), chunk_size):
-        chunk = args_list[i:i + chunk_size]
+            if i % 100 == 0:
+                print(f"Processed {i}/{len(valid_files)} files")
 
-        with Pool(num_workers) as pool:
-            results = pool.map(process_single_file, chunk)
+        except Exception as e:
+            print(f"Error processing {info['voice_path']}: {e}")
 
-        # 결과 처리
-        for result in results:
-            if result['status'] == 'success':
-                features.append(result['feature'])
-                texts.append(result['text'])
-                majors.append(result['major'])
-                file_ids.append(result['file_id'])
-                total_processed += 1
-            elif result['status'] == 'audio_not_found':
-                print(f"Audio not found: {result['file']}")
-                print(f"Expected at: {result['expected_path']}")
-            else:
-                print(f"Error processing {result['file']}: {result['error']}")
+    # 저장
+    save_data = {'features': features, 'texts': texts, 'majors': majors}
+    with open(os.path.join(output_dir, 'korean_lecture_features.pkl'), 'wb') as f:
+        pickle.dump(save_data, f)
 
-        # 진행상황 출력
-        elapsed = time.time() - start_time
-        print(f"Processed {total_processed}/{len(json_files)} files ({elapsed:.1f}s)")
-
-        # 중간 저장 (메모리 절약)
-        if len(features) >= 1000:
-            save_chunk_data(features, texts, majors, file_ids, output_dir, i // chunk_size)
-            features, texts, majors, file_ids = [], [], [], []
-
-    # 마지막 데이터 저장
-    if features:
-        save_chunk_data(features, texts, majors, file_ids, output_dir, "final")
-
-    # 모든 청크 병합
-    merge_chunk_files(output_dir)
-
-    print(f"Total processed: {total_processed} samples in {time.time() - start_time:.1f}s")
-    return total_processed
+    return len(features)
 
 
 def save_chunk_data(features, texts, majors, file_ids, output_dir, chunk_id):
@@ -316,12 +254,46 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
 
 def dump_feature_korean(training_dir, output_dir):
     """기존 함수 (호환성 유지)"""
-    return dump_feature_korean_mp(training_dir, output_dir)
+    return dump_feature_korean_safe(training_dir, output_dir)
 
 
 def get_rarewords_korean(training_dir, output_dir):
     """기존 함수 (호환성 유지)"""
     return get_rarewords_korean_mp(training_dir, output_dir)
+
+
+def process_single_file_light(args):
+    """
+    메모리 절약 버전 - Whisper 모델 로드 없이 경로만 확인
+    """
+    json_file, training_dir = args
+
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        audio_relative_path = data["01_dataset"]["3_src_path"]
+        text = data["06_transcription"]["1_text"]
+        major = data["03_lectureinfo"]["3_major_category"]
+        file_id = data["01_dataset"]["1_identifier"]
+
+        # C02199/U00001.wav 추출
+        audio_file_path = '/'.join(audio_relative_path.split('/')[-2:])
+        voice_path = os.path.join(training_dir, "Voice", audio_file_path)
+
+        if os.path.exists(voice_path):
+            return {
+                'voice_path': voice_path,
+                'text': text,
+                'major': major,
+                'file_id': file_id,
+                'status': 'success'
+            }
+        else:
+            return {'status': 'audio_not_found', 'file': str(json_file)}
+
+    except Exception as e:
+        return {'status': 'error', 'file': str(json_file), 'error': str(e)}
 
 
 # 사용 예시
@@ -351,7 +323,7 @@ if __name__ == "__main__":
     # 1. 특징 추출 (멀티프로세싱)
     print("\n=== Feature Extraction (Multiprocessing) ===")
     start_time = time.time()
-    total_processed = dump_feature_korean_mp(training_dir, output_dir, num_workers)
+    total_processed = dump_feature_korean_safe(training_dir, output_dir)
     feature_time = time.time() - start_time
     print(f"Feature extraction completed: {total_processed} files in {feature_time:.1f}s")
 
