@@ -1,0 +1,14 @@
+[project]
+name = "whisperTCPGen"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "gtts>=2.5.4",
+    "numpy>=2.2.6",
+    "openai-whisper>=20240930",
+    "pandas>=2.3.0",
+    "pydub>=0.25.1",
+    "soundfile>=0.13.1",
+    "torch>=2.7.1",
+]
