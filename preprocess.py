@@ -13,13 +13,16 @@ import time
 
 def dump_feature_korean_safe(training_dir, output_dir, num_workers=None):
     """
-    메모리 안전 버전 - 단일 프로세스로 순차 처리
+    길이 통일된 mel spectrogram 생성 버전
     """
     if num_workers is None:
-        num_workers = 4  # 기본값 설정
+        num_workers = 4
 
     # Whisper 모델을 한 번만 로드
     model = whisper.load_model("medium")
+
+    # 길이 설정 (Whisper 기본값)
+    TARGET_LENGTH = 3000  # 30초 * 100 frames/sec = 3000 frames
 
     # 경로 정보만 멀티프로세싱으로 수집
     label_dir = os.path.join(training_dir, "Label")
@@ -28,7 +31,7 @@ def dump_feature_korean_safe(training_dir, output_dir, num_workers=None):
     args_list = [(json_file, training_dir) for json_file in json_files]
 
     # 경로 정보 수집 (멀티프로세싱)
-    with Pool(4) as pool:  # 적은 수의 프로세스
+    with Pool(4) as pool:
         file_info_list = pool.map(process_single_file_light, args_list)
 
     valid_files = [info for info in file_info_list if info['status'] == 'success']
@@ -40,18 +43,32 @@ def dump_feature_korean_safe(training_dir, output_dir, num_workers=None):
 
     for i, info in enumerate(valid_files):
         try:
+            # 1. 오디오 로드
             audio = whisper.load_audio(info['voice_path'])
+
+            # 2. 길이 통일 (패딩/트리밍)
+            audio = pad_or_trim_audio(audio, target_length=30.0)  # 30초로 통일
+
+            # 3. mel spectrogram 생성
             mel = whisper.log_mel_spectrogram(audio)
+
+            # 4. mel spectrogram도 길이 확인/통일
+            mel = pad_or_trim_mel(mel, target_frames=TARGET_LENGTH)
 
             features.append(mel)
             texts.append(info['text'])
             majors.append(info['major'])
 
             if i % 100 == 0:
-                print(f"Processed {i}/{len(valid_files)} files")
+                print(f"Processed {i}/{len(valid_files)} files - mel shape: {mel.shape}")
 
         except Exception as e:
             print(f"Error processing {info['voice_path']}: {e}")
+            continue
+
+    # 저장 전 shape 확인
+    if features:
+        print(f"Final mel shapes: {[f.shape for f in features[:5]]}...")  # 처음 5개만 확인
 
     # 저장
     save_data = {'features': features, 'texts': texts, 'majors': majors}
@@ -61,6 +78,132 @@ def dump_feature_korean_safe(training_dir, output_dir, num_workers=None):
     return len(features)
 
 
+def pad_or_trim_audio(audio, target_length=30.0):
+    """
+    오디오를 target_length 초로 패딩하거나 트리밍
+    """
+    target_samples = int(target_length * whisper.audio.SAMPLE_RATE)  # 16000 * 30 = 480000
+
+    if len(audio) > target_samples:
+        # 트리밍: 처음 30초만 사용
+        audio = audio[:target_samples]
+    elif len(audio) < target_samples:
+        # 패딩: 0으로 채움
+        padding_needed = target_samples - len(audio)
+        audio = np.pad(audio, (0, padding_needed), mode='constant', constant_values=0)
+
+    return audio
+
+
+def pad_or_trim_mel(mel, target_frames=3000):
+    """
+    mel spectrogram을 target_frames로 패딩하거나 트리밍
+    mel shape: (80, time_frames)
+    """
+    current_frames = mel.shape[1]
+
+    if current_frames > target_frames:
+        # 트리밍
+        mel = mel[:, :target_frames]
+    elif current_frames < target_frames:
+        # 패딩
+        padding_needed = target_frames - current_frames
+        mel = np.pad(mel, ((0, 0), (0, padding_needed)), mode='constant', constant_values=mel.min())
+
+    return mel
+
+
+def validate_mel_shapes(features):
+    """
+    생성된 mel spectrogram들의 shape이 모두 동일한지 확인
+    """
+    if not features:
+        return False, "No features"
+
+    target_shape = features[0].shape
+    for i, feat in enumerate(features):
+        if feat.shape != target_shape:
+            return False, f"Shape mismatch at index {i}: {feat.shape} vs {target_shape}"
+
+    return True, f"All {len(features)} features have shape {target_shape}"
+
+
+def dump_feature_korean_batch_safe(training_dir, output_dir, num_workers=None, chunk_size=1000):
+    """
+    대용량 데이터셋을 위한 청크별 처리 버전
+    """
+    if num_workers is None:
+        num_workers = 4
+
+    model = whisper.load_model("medium")
+    TARGET_LENGTH = 3000
+
+    # 경로 정보 수집
+    label_dir = os.path.join(training_dir, "Label")
+    json_files = list(Path(label_dir).glob("**/*.json"))
+    args_list = [(json_file, training_dir) for json_file in json_files]
+
+    with Pool(4) as pool:
+        file_info_list = pool.map(process_single_file_light, args_list)
+
+    valid_files = [info for info in file_info_list if info['status'] == 'success']
+
+    # 청크별로 처리
+    all_features = []
+    all_texts = []
+    all_majors = []
+
+    for chunk_start in range(0, len(valid_files), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, len(valid_files))
+        chunk_files = valid_files[chunk_start:chunk_end]
+
+        print(f"Processing chunk {chunk_start // chunk_size + 1}: files {chunk_start}-{chunk_end}")
+
+        chunk_features = []
+        chunk_texts = []
+        chunk_majors = []
+
+        for i, info in enumerate(chunk_files):
+            try:
+                audio = whisper.load_audio(info['voice_path'])
+                audio = pad_or_trim_audio(audio, target_length=30.0)
+                mel = whisper.log_mel_spectrogram(audio)
+                mel = pad_or_trim_mel(mel, target_frames=TARGET_LENGTH)
+
+                chunk_features.append(mel)
+                chunk_texts.append(info['text'])
+                chunk_majors.append(info['major'])
+
+            except Exception as e:
+                print(f"Error processing {info['voice_path']}: {e}")
+                continue
+
+        # 청크 검증
+        is_valid, msg = validate_mel_shapes(chunk_features)
+        if not is_valid:
+            print(f"Warning: {msg}")
+        else:
+            print(f"Chunk validation: {msg}")
+
+        all_features.extend(chunk_features)
+        all_texts.extend(chunk_texts)
+        all_majors.extend(chunk_majors)
+
+        print(f"Chunk {chunk_start // chunk_size + 1} completed: {len(chunk_features)} features")
+
+    # 최종 검증
+    is_valid, msg = validate_mel_shapes(all_features)
+    print(f"Final validation: {msg}")
+
+    # 저장
+    save_data = {'features': all_features, 'texts': all_texts, 'majors': all_majors}
+    with open(os.path.join(output_dir, 'korean_lecture_features.pkl'), 'wb') as f:
+        pickle.dump(save_data, f)
+
+    return len(all_features)
+
+
+# 기존 함수들 (변경 없음)
 def save_chunk_data(features, texts, majors, file_ids, output_dir, chunk_id):
     """청크 데이터 저장"""
     save_data = {
@@ -93,10 +236,8 @@ def merge_chunk_files(output_dir):
         all_majors.extend(data['majors'])
         all_file_ids.extend(data['file_ids'])
 
-        # 청크 파일 삭제
         os.remove(chunk_file)
 
-    # 최종 파일 저장
     final_data = {
         'features': all_features,
         'texts': all_texts,
@@ -109,9 +250,7 @@ def merge_chunk_files(output_dir):
 
 
 def process_text_file(args):
-    """
-    텍스트 처리용 단일 파일 함수 (멀티프로세싱용)
-    """
+    """텍스트 처리용 단일 파일 함수 (멀티프로세싱용)"""
     json_file, training_dir = args
 
     try:
@@ -137,10 +276,7 @@ def process_text_file(args):
 
 
 def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
-    """
-    멀티프로세싱을 사용한 희귀 단어 추출
-    training_dir: IT_Lecture/Training 경로
-    """
+    """멀티프로세싱을 사용한 희귀 단어 추출"""
     if num_workers is None:
         num_workers = cpu_count()
 
@@ -148,12 +284,10 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Label 폴더에서 JSON 파일 목록 수집
     label_dir = os.path.join(training_dir, "Label")
     json_files = list(Path(label_dir).glob("**/*.json"))
     print(f"Processing {len(json_files)} files for rare words")
 
-    # 멀티프로세싱 인자 준비
     args_list = [(json_file, training_dir) for json_file in json_files]
 
     all_words = []
@@ -161,8 +295,6 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
     utterance_data = []
 
     start_time = time.time()
-
-    # 청크 단위로 처리
     chunk_size = 500
 
     for i in range(0, len(args_list), chunk_size):
@@ -171,7 +303,6 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
         with Pool(num_workers) as pool:
             results = pool.map(process_text_file, chunk)
 
-        # 결과 수집
         for result in results:
             if result['status'] == 'success':
                 words = result['words']
@@ -193,7 +324,6 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
         elapsed = time.time() - start_time
         print(f"Text processed: {i + len(chunk)}/{len(json_files)} files ({elapsed:.1f}s)")
 
-    # 나머지는 기존과 동일
     word_freq = Counter(all_words)
     rare_words = [word for word, freq in word_freq.items() if freq <= 3 and len(word) > 1]
 
@@ -220,7 +350,6 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
         if major in major_rare_words:
             final_rare_words.update(major_rare_words[major][:50])
 
-    # 파일 저장
     with open(os.path.join(output_dir, 'korean_rareword_error.txt'), 'w', encoding='utf-8') as f:
         for word in sorted(final_rare_words):
             f.write(f"{word}\n")
@@ -229,7 +358,6 @@ def get_rarewords_korean_mp(training_dir, output_dir, num_workers=None):
         for word in sorted(final_rare_words):
             f.write(f"{word}\n")
 
-    # 발화별 편향 단어 생성
     utterance_bias = {}
     for i, utt_data in enumerate(utterance_data):
         bias_words = [word for word in utt_data['words'] if word in final_rare_words]
@@ -263,9 +391,7 @@ def get_rarewords_korean(training_dir, output_dir):
 
 
 def process_single_file_light(args):
-    """
-    메모리 절약 버전 - Whisper 모델 로드 없이 경로만 확인
-    """
+    """메모리 절약 버전 - Whisper 모델 로드 없이 경로만 확인"""
     json_file, training_dir = args
 
     try:
@@ -277,7 +403,6 @@ def process_single_file_light(args):
         major = data["03_lectureinfo"]["3_major_category"]
         file_id = data["01_dataset"]["1_identifier"]
 
-        # C02199/U00001.wav 추출
         audio_file_path = '/'.join(audio_relative_path.split('/')[-2:])
         voice_path = os.path.join(training_dir, "Voice", audio_file_path)
 
@@ -298,15 +423,12 @@ def process_single_file_light(args):
 
 # 사용 예시
 if __name__ == "__main__":
-    # 파일 구조에 맞는 경로 설정
-    training_dir = "./IT_Lecture/Training"  # Training 폴더 경로
+    training_dir = "./IT_Lecture/Training"
     output_dir = "./korean_processed"
 
-    # CPU 코어 수에 따른 워커 수 설정
-    num_workers = cpu_count()  # 최대 8개 프로세스
+    num_workers = cpu_count()
     print(f"Available CPU cores: {cpu_count()}, Using {num_workers} workers")
 
-    # 경로 확인
     label_dir = os.path.join(training_dir, "Label")
     voice_dir = os.path.join(training_dir, "Voice")
 
@@ -320,15 +442,15 @@ if __name__ == "__main__":
     print(f"Label directory: {label_dir}")
     print(f"Voice directory: {voice_dir}")
 
-    # 1. 특징 추출 (멀티프로세싱)
-    print("\n=== Feature Extraction (Multiprocessing) ===")
+    # 1. 특징 추출 (길이 통일된 버전)
+    print("\n=== Feature Extraction (Length Normalized) ===")
     start_time = time.time()
     total_processed = dump_feature_korean_safe(training_dir, output_dir)
     feature_time = time.time() - start_time
     print(f"Feature extraction completed: {total_processed} files in {feature_time:.1f}s")
 
-    # 2. 희귀 단어 추출 (멀티프로세싱)
-    print("\n=== Rare Words Extraction (Multiprocessing) ===")
+    # 2. 희귀 단어 추출
+    print("\n=== Rare Words Extraction ===")
     start_time = time.time()
     rare_words, bias_data = get_rarewords_korean_mp(training_dir, output_dir, num_workers)
     text_time = time.time() - start_time
@@ -337,6 +459,4 @@ if __name__ == "__main__":
     print("\n=== Processing Complete ===")
     print(f"Total time: {feature_time + text_time:.1f}s")
     print(f"Features saved to: {output_dir}/korean_lecture_features.pkl")
-    print(f"Rare words saved to: {output_dir}/korean_rareword_error.txt")
-    print(f"Bias data saved to: {output_dir}/korean_lecture_bias.json")
-    print(f"Speed improvement: ~{num_workers}x faster than single-threaded")
+    print(f"Note: All mel spectrograms are now normalized to (80, 3000) shape")
