@@ -11,19 +11,155 @@ from functools import partial
 import time
 
 
-def dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers=None):
+def pad_or_trim_audio(audio, target_length=30.0):
     """
-    TCPGEN WhisperBiasing 형식으로 mel spectrogram 생성
+    오디오를 target_length 초로 패딩하거나 트리밍
+    """
+    target_samples = int(target_length * whisper.audio.SAMPLE_RATE)  # 16000 * 30 = 480000
+
+    if len(audio) > target_samples:
+        # 트리밍: 처음 30초만 사용
+        audio = audio[:target_samples]
+    elif len(audio) < target_samples:
+        # 패딩: 0으로 채움
+        padding_needed = target_samples - len(audio)
+        audio = np.pad(audio, (0, padding_needed), mode='constant', constant_values=0)
+
+    return audio
+
+
+def pad_or_trim_mel(mel, target_frames=3000):
+    """
+    mel spectrogram을 target_frames로 패딩하거나 트리밍
+    mel shape: (80, time_frames)
+    """
+    current_frames = mel.shape[1]
+
+    if current_frames > target_frames:
+        # 트리밍
+        mel = mel[:, :target_frames]
+    elif current_frames < target_frames:
+        # 패딩
+        padding_needed = target_frames - current_frames
+        mel = np.pad(mel, ((0, 0), (0, padding_needed)), mode='constant', constant_values=mel.min())
+
+    return mel
+
+
+def process_batch_whisper_features(batch_args):
+    """
+    배치 단위로 Whisper 처리 (메모리 효율성 개선)
+    한 워커가 여러 파일을 순차적으로 처리하여 모델 로딩 오버헤드 감소
+    """
+    batch_file_infos, model_name, target_length, all_rare_words = batch_args
+
+    # 배치 처리용 모델 로드 (한 번만)
+    model = whisper.load_model(model_name)
+    target_frames = int(target_length * 100)  # 100 frames/sec
+
+    results = []
+
+    for i, file_info in enumerate(batch_file_infos):  # 👈 i 추가
+        try:
+            if i % 10 == 0:
+                print(f"    배치 내 진행: {i}/{len(batch_file_infos)} 파일 처리 중...")
+
+            # 오디오 처리
+            audio = whisper.load_audio(file_info['voice_path'])
+            audio = pad_or_trim_audio(audio, target_length=target_length)
+
+            # mel spectrogram 생성
+            mel = whisper.log_mel_spectrogram(audio)
+            mel = pad_or_trim_mel(mel, target_frames=target_frames)
+
+            # 바이어싱 단어
+            utterance_words = set(file_info['text'].split())
+            bias_words = list(utterance_words.intersection(all_rare_words))
+
+            mel_numpy = mel.numpy() if isinstance(mel, torch.Tensor) else mel
+
+            results.append({
+                'status': 'success',
+                'fbank': mel_numpy,
+                'words': file_info['text'],
+                'blist': bias_words,
+                'voice_path': file_info['voice_path']
+            })
+
+        except Exception as e:
+            results.append({
+                'status': 'error',
+                'error': str(e),
+                'voice_path': file_info['voice_path']
+            })
+
+    return results
+
+
+def process_single_whisper_feature(args):
+    """
+    단일 파일의 Whisper 특성 추출 (멀티프로세싱용)
+    각 워커에서 Whisper 모델을 별도로 로드
+    """
+    file_info, model_name, target_length, all_rare_words = args
+
+    try:
+        # 각 워커에서 모델을 별도로 로드
+        model = whisper.load_model(model_name)
+
+        # 1. 오디오 로드
+        audio = whisper.load_audio(file_info['voice_path'])
+
+        # 2. 길이 통일 (패딩/트리밍)
+        audio = pad_or_trim_audio(audio, target_length=target_length)
+
+        # 3. mel spectrogram 생성
+        mel = whisper.log_mel_spectrogram(audio)
+
+        # 4. mel spectrogram 길이 통일
+        target_frames = int(target_length * 100)  # 100 frames/sec
+        mel = pad_or_trim_mel(mel, target_frames=target_frames)
+
+        # 5. 바이어싱 단어 추출
+        utterance_words = set(file_info['text'].split())
+        bias_words = list(utterance_words.intersection(all_rare_words))
+
+        # numpy로 변환 (pickle 호환성)
+        mel_numpy = mel.numpy() if isinstance(mel, torch.Tensor) else mel
+
+        return {
+            'status': 'success',
+            'fbank': mel_numpy,
+            'words': file_info['text'],
+            'blist': bias_words,
+            'voice_path': file_info['voice_path']
+        }
+
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e),
+            'voice_path': file_info['voice_path']
+        }
+
+
+def dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers=None, batch_size=50,
+                                      use_batch_processing=True):
+    """
+    완전 멀티프로세싱 적용 TCPGEN WhisperBiasing 형식으로 mel spectrogram 생성
     출력: fbank.pt 파일 (키: fbank, words, blist)
+
+    Args:
+        training_dir: 훈련 데이터 디렉토리
+        output_dir: 출력 디렉토리
+        num_workers: 워커 수 (None이면 CPU 코어 수의 80%)
+        batch_size: 배치 처리 시 배치 크기
+        use_batch_processing: True면 배치 처리, False면 개별 처리
     """
     if num_workers is None:
-        num_workers = 6
+        num_workers = max(1, int(cpu_count() * 0.8))  # CPU 코어의 80% 사용
 
-    # Whisper 모델을 한 번만 로드
-    model = whisper.load_model("medium")
-
-    # 길이 설정 (Whisper 기본값)
-    TARGET_LENGTH = 3000  # 30초 * 100 frames/sec = 3000 frames
+    print(f"Using {num_workers} workers, batch_size={batch_size}, batch_processing={use_batch_processing}")
 
     # 경로 정보만 멀티프로세싱으로 수집
     label_dir = os.path.join(training_dir, "Label")
@@ -32,10 +168,14 @@ def dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers=None
     args_list = [(json_file, training_dir) for json_file in json_files]
 
     # 경로 정보 수집 (멀티프로세싱)
+    print("Collecting file information...")
     with Pool(num_workers) as pool:
         file_info_list = pool.map(process_single_file_light, args_list)
 
     valid_files = [info for info in file_info_list if info['status'] == 'success']
+    print(f"Valid files: {len(valid_files)}")
+
+    valid_files = valid_files[:len(valid_files) // 2]  # 앞쪽 50%만 사용
 
     # 바이어싱 단어 로드 (미리 생성된 희귀 단어 파일)
     rare_words_file = os.path.join(output_dir, 'korean_rareword_error.txt')
@@ -46,41 +186,59 @@ def dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers=None
     with open(rare_words_file, 'r', encoding='utf-8') as f:
         all_rare_words = set(word.strip() for word in f.readlines())
 
-    # 순차적으로 Whisper 처리 (메모리 절약)
-    fbank_features = []  # mel spectrogram
-    words_list = []  # 전체 텍스트
-    blist_per_utterance = []  # 각 발화별 바이어싱 단어
+    # Whisper 특성 추출 (완전 멀티프로세싱)
+    model_name = "small"
+    target_length = 30.0
 
-    for i, info in enumerate(valid_files):
-        try:
-            # 1. 오디오 로드
-            audio = whisper.load_audio(info['voice_path'])
+    print(f"Starting Whisper feature extraction with {num_workers} workers...")
+    start_time = time.time()
 
-            # 2. 길이 통일 (패딩/트리밍)
-            audio = pad_or_trim_audio(audio, target_length=30.0)  # 30초로 통일
+    if use_batch_processing:
+        # 배치 처리 방식 (메모리 효율적)
+        batches = [valid_files[i:i + batch_size] for i in range(0, len(valid_files), batch_size)]
+        batch_args = [(batch, model_name, target_length, all_rare_words) for batch in batches]
 
-            # 3. mel spectrogram 생성
-            mel = whisper.log_mel_spectrogram(audio)
+        print(f"Processing {len(batches)} batches...")
 
-            # 4. mel spectrogram도 길이 확인/통일
-            mel = pad_or_trim_mel(mel, target_frames=TARGET_LENGTH)
+        with Pool(num_workers) as pool:
+            batch_results = pool.map(process_batch_whisper_features, batch_args)
 
-            # 5. 이 발화의 바이어싱 단어 추출
-            utterance_words = set(info['text'].split())
-            bias_words_for_this_utterance = list(utterance_words.intersection(all_rare_words))
+        # 배치 결과 평면화
+        all_results = []
+        for batch_result in batch_results:
+            all_results.extend(batch_result)
 
-            # 6. TCPGEN 형식으로 저장
-            fbank_features.append(mel.numpy() if isinstance(mel, torch.Tensor) else mel)
-            words_list.append(info['text'])
-            blist_per_utterance.append(bias_words_for_this_utterance)
+    else:
+        # 개별 처리 방식 (더 많은 병렬성)
+        feature_args = [(info, model_name, target_length, all_rare_words) for info in valid_files]
 
-            if i % 100 == 0:
-                print(
-                    f"Processed {i}/{len(valid_files)} files - mel shape: {mel.shape}, bias words: {len(bias_words_for_this_utterance)}")
+        print(f"Processing {len(feature_args)} files individually...")
 
-        except Exception as e:
-            print(f"Error processing {info['voice_path']}: {e}")
-            continue
+        with Pool(num_workers) as pool:
+            all_results = pool.map(process_single_whisper_feature, feature_args)
+
+    processing_time = time.time() - start_time
+    print(f"Whisper processing completed in {processing_time:.1f}s")
+
+    # 성공한 결과만 필터링
+    successful_results = [r for r in all_results if r['status'] == 'success']
+    failed_results = [r for r in all_results if r['status'] == 'error']
+
+    print(f"Successful: {len(successful_results)}, Failed: {len(failed_results)}")
+
+    if failed_results:
+        print("Failed files (first 5):")
+        for fail in failed_results[:5]:
+            print(f"  {fail['voice_path']}: {fail['error']}")
+
+    if not successful_results:
+        print("No successful results to save!")
+        return 0
+
+    # TCPGEN 형식으로 저장
+    fbank_features = [r['fbank'] for r in successful_results]
+    words_list = [r['words'] for r in successful_results]
+    blist_per_utterance = [r['blist'] for r in successful_results]
 
     # 저장 전 shape 확인
     if fbank_features:
@@ -103,6 +261,12 @@ def dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers=None
     with open(pickle_file, 'wb') as f:
         pickle.dump(tcpgen_data, f)
     print(f"Pickle format data saved to: {pickle_file}")
+
+    # 첫 번째 샘플 정보 출력
+    if fbank_features:
+        print(f"Sample mel shape: {fbank_features[0].shape}")
+        print(f"Sample text: {words_list[0][:100]}...")
+        print(f"Sample bias words: {blist_per_utterance[0][:5]}")
 
     return len(fbank_features)
 
@@ -155,41 +319,6 @@ def create_tcpgen_json_files(training_dir, output_dir, rare_words_file):
     print(f"Utterances with bias words: {len(utterance_data)}")
 
     return utterance_data
-
-
-def pad_or_trim_audio(audio, target_length=30.0):
-    """
-    오디오를 target_length 초로 패딩하거나 트리밍
-    """
-    target_samples = int(target_length * whisper.audio.SAMPLE_RATE)  # 16000 * 30 = 480000
-
-    if len(audio) > target_samples:
-        # 트리밍: 처음 30초만 사용
-        audio = audio[:target_samples]
-    elif len(audio) < target_samples:
-        # 패딩: 0으로 채움
-        padding_needed = target_samples - len(audio)
-        audio = np.pad(audio, (0, padding_needed), mode='constant', constant_values=0)
-
-    return audio
-
-
-def pad_or_trim_mel(mel, target_frames=3000):
-    """
-    mel spectrogram을 target_frames로 패딩하거나 트리밍
-    mel shape: (80, time_frames)
-    """
-    current_frames = mel.shape[1]
-
-    if current_frames > target_frames:
-        # 트리밍
-        mel = mel[:, :target_frames]
-    elif current_frames < target_frames:
-        # 패딩
-        padding_needed = target_frames - current_frames
-        mel = np.pad(mel, ((0, 0), (0, padding_needed)), mode='constant', constant_values=mel.min())
-
-    return mel
 
 
 def validate_tcpgen_format(data_file):
@@ -396,18 +525,32 @@ def process_single_file_light(args):
 
 
 # TCPGEN용 전체 파이프라인
-def run_tcpgen_preprocessing_pipeline(training_dir, output_dir, num_workers=None):
+def run_tcpgen_preprocessing_pipeline(training_dir, output_dir, num_workers=None, batch_size=50,
+                                      use_batch_processing=True):
     """
-    TCPGEN WhisperBiasing용 전체 전처리 파이프라인
+    완전 멀티프로세싱 적용 TCPGEN WhisperBiasing용 전체 전처리 파이프라인
     1. 희귀 단어 추출
-    2. TCPGEN 형식 특징 추출
+    2. TCPGEN 형식 특징 추출 (멀티프로세싱)
     3. JSON 파일 생성
     4. 검증
+
+    Args:
+        training_dir: 훈련 데이터 디렉토리
+        output_dir: 출력 디렉토리
+        num_workers: 워커 수 (None이면 CPU 코어 수의 80%)
+        batch_size: 배치 처리 시 배치 크기
+        use_batch_processing: True면 배치 처리, False면 개별 처리
     """
 
     print("=" * 60)
-    print("TCPGEN WHISPERBIASING 전처리 파이프라인")
+    print("TCPGEN WHISPERBIASING 전처리 파이프라인 (완전 멀티프로세싱)")
     print("=" * 60)
+
+    if num_workers is None:
+        num_workers = max(1, int(cpu_count() * 0.8))
+
+    print(f"Using {num_workers} workers (CPU cores: {cpu_count()})")
+    print(f"Batch processing: {use_batch_processing}, Batch size: {batch_size}")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -418,12 +561,18 @@ def run_tcpgen_preprocessing_pipeline(training_dir, output_dir, num_workers=None
     text_time = time.time() - start_time
     print(f"희귀 단어 추출 완료: {len(rare_words)}개 단어, {text_time:.1f}초")
 
-    # 2. TCPGEN 형식 특징 추출
-    print("\n2. TCPGEN 형식 특징 추출 중...")
+    # 2. TCPGEN 형식 특징 추출 (완전 멀티프로세싱)
+    print("\n2. TCPGEN 형식 특징 추출 중 (멀티프로세싱)...")
     start_time = time.time()
-    total_processed = dump_feature_korean_tcpgen_format(training_dir, output_dir, num_workers)
+    total_processed = dump_feature_korean_tcpgen_format(
+        training_dir, output_dir, num_workers, batch_size, use_batch_processing
+    )
     feature_time = time.time() - start_time
     print(f"특징 추출 완료: {total_processed}개 파일, {feature_time:.1f}초")
+
+    if total_processed == 0:
+        print("특징 추출 실패! 파이프라인을 중단합니다.")
+        return 0
 
     # 3. 검증
     print("\n3. TCPGEN 형식 검증 중...")
@@ -437,6 +586,9 @@ def run_tcpgen_preprocessing_pipeline(training_dir, output_dir, num_workers=None
     print("전처리 완료!")
     print("=" * 60)
     print(f"총 처리 시간: {feature_time + text_time:.1f}초")
+    print(f"Whisper 처리 시간: {feature_time:.1f}초 (멀티프로세싱 적용)")
+    print(f"텍스트 처리 시간: {text_time:.1f}초")
+    print(f"속도 향상: Whisper 처리가 {num_workers}개 워커로 병렬화됨")
     print(f"생성된 파일들:")
     print(f"  - fbank.pt (TCPGEN 메인 데이터)")
     print(f"  - korean_rareword_error.txt (바이어싱 단어 목록)")
@@ -451,7 +603,7 @@ if __name__ == "__main__":
     training_dir = "./IT_Lecture/Training"
     output_dir = "./korean_processed_tcpgen"
 
-    num_workers = cpu_count()
+    num_workers = max(1, int(cpu_count() * 0.8))  # CPU 코어의 80% 사용
     print(f"Available CPU cores: {cpu_count()}, Using {num_workers} workers")
 
     label_dir = os.path.join(training_dir, "Label")
@@ -467,8 +619,22 @@ if __name__ == "__main__":
     print(f"Label directory: {label_dir}")
     print(f"Voice directory: {voice_dir}")
 
-    # TCPGEN 전처리 파이프라인 실행
-    total_processed = run_tcpgen_preprocessing_pipeline(training_dir, output_dir, num_workers)
+    # TCPGEN 전처리 파이프라인 실행 (완전 멀티프로세싱)
+    total_processed = run_tcpgen_preprocessing_pipeline(
+        training_dir,
+        output_dir,
+        num_workers=num_workers,
+        batch_size=30,  # 메모리에 따라 조절
+        use_batch_processing=True  # 메모리 효율적
+    )
 
     print(f"\n🎉 TCPGEN 전처리 완료!")
     print(f"이제 WhisperBiasing 레포의 train.py를 실행할 수 있습니다.")
+
+    # 개별 처리 방식으로 실행하고 싶다면:
+    # total_processed = run_tcpgen_preprocessing_pipeline(
+    #     training_dir,
+    #     output_dir,
+    #     num_workers=4,  # 메모리 사용량이 높으므로 워커 수 줄임
+    #     use_batch_processing=False
+    # )
