@@ -57,7 +57,8 @@ if args.loadfrom != "":
 else:
     model = whisper.load_model(args.modeltype)
 model.train()
-if args.useGPT:
+#if args.useGPT: # gpt2 관련 주석 처리
+if False:
     # GPTmodel = GPT2Model.from_pretrained('gpt2').to(model.device)
     GPTmodel = GPT2LMHeadModel.from_pretrained('gpt2', output_hidden_states=True).to(model.device)
     GPThiddim = GPTmodel.config.n_embd
@@ -83,7 +84,7 @@ if args.loadfrom == "":
         biasing=args.biasing,
         GNNtype=args.GNNtype,
         GNNdim=args.GNNdim,
-        useGPT=args.useGPT,
+#        useGPT=args.useGPT, # gpt2 관련 주석 처리
         GPThiddim=GPThiddim,
     ).to(model.device)
 whisperbiasing.train()
@@ -118,7 +119,8 @@ for epoch in range(args.nepochs):
         GPT_distribution = None
         target = pad_sequence(origtarget, batch_first=True, padding_value=-100).to(model.device)
         targetmask = target != -100
-        if args.useGPT:
+#        if args.useGPT: # gpt2 관련 주석 처리
+        if False:
             with torch.no_grad():
                 # Replace Whisper bos token with GPT2 bos token
                 GPTtarget_ids = (target*targetmask)[:, sotlen-1:-1]
@@ -179,7 +181,8 @@ for epoch in range(args.nepochs):
             # target = [torch.tensor(y, dtype=torch.long) for y in tgt]
             target = pad_sequence(target, batch_first=True, padding_value=-100).to(model.device)
             targetmask = target != -100
-            if args.useGPT:
+#            if args.useGPT: # gpt2 관련 주석 처리
+            if False:
                 # Replace Whisper bos token with GPT2 bos token
                 GPTtarget_ids = (target*targetmask)[:, sotlen-1:-1]
                 GPTtarget_ids[:, 0] = GPTtokenizer.bos_token_id
